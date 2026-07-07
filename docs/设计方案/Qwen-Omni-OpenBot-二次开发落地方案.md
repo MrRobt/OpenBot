@@ -33,6 +33,11 @@
 │  │ int4 量化 / vLLM 服务    │    │ GPT-SoVITS / F5-TTS         │ │
 │  │ http://pc-ip:8000        │    │ http://pc-ip:8001            │ │
 │  └───────────┬─────────────┘    └──────────────┬──────────────┘ │
+│  ┌─────────────────────────────────────────────┐                │
+│  │ Depth Anything 3  3D 感知服务               │                │
+│  │ 深度估计 + 相机位姿 + 三维建图              │                │
+│  │ http://pc-ip:8002                            │                │
+│  └─────────────────────┬───────────────────────┘                │
 │              │                                  │                │
 │              └──────────────┬───────────────────┘                │
 │                             ▼                                   │
@@ -40,6 +45,9 @@
 │                  │ Robot Brain API     │                        │
 │                  │ FastAPI  orchestrator│                       │
 │                  │ http://pc-ip:8080   │                        │
+│                  │                     │                        │
+│                  │ 融合 Qwen / TTS /   │                        │
+│                  │ 3D 感知 / 导航      │                        │
 │                  └──────────┬──────────┘                        │
 └─────────────────────────────┼───────────────────────────────────┘
                               │ WiFi
@@ -64,6 +72,8 @@
 | 层级 | 位置 | 职责 | 频率 |
 |------|------|------|------|
 | 大脑决策 | 局域网电脑 | 接收图像/传感器/语音，输出高层指令 + TTS 文本 | 0.5~1 Hz |
+| 3D 感知与建图 | 局域网电脑 | Depth Anything 3 深度估计、位姿解算、局部点云地图 | 1~2 Hz |
+| 导航规划 | 局域网电脑 | 基于 3D 地图做障碍物检测与路径规划 | 0.5~1 Hz |
 | 感知采集 | OpenBot 手机 | 相机、麦克风、超声波、里程计 | 持续 |
 | 本地执行 | OpenBot 手机 | 指令映射、电机控制、避障、急停 | 20~50 Hz |
 | 运动执行 | Arduino/小车 | PWM 驱动电机 | 实时 |
@@ -123,14 +133,87 @@ python api.py \
 
 ### 3.3 Robot Brain API（整合层）
 
-FastAPI 服务，统一对外暴露一个接口 `/decide`，内部调用 Qwen + TTS。
+FastAPI 服务，统一对外暴露一个接口 `/decide`，内部调用 Qwen + TTS + 3D 感知服务。
 
 **功能**
 
 - 接收手机上传的图像、传感器、语音/文本指令。
+- 调用 Depth Anything 3 获取深度图与相机位姿。
+- 维护局部三维点云地图，并执行局部路径规划。
 - 构造 system prompt + user prompt，调用 Qwen。
 - 解析 Qwen 返回的 JSON，提取高层指令与 TTS 文本。
 - 调用 TTS 服务生成音频，base64 编码后一并返回。
+
+---
+
+### 3.4 Depth Anything 3 3D 感知服务
+
+**定位**：把单目 RGB 图像升级为 RGB-D，并估计相机运动，为导航提供三维空间信息。
+
+**运行位置**：局域网电脑，独立服务 `http://pc-ip:8002`。
+
+**功能模块**
+
+| 模块 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| 深度估计 | RGB 图像 | 深度图 (H×W) | Depth Anything 3 前向推理 |
+| 位姿估计 | 连续两帧 RGB-D | 相机相对位姿 T∈SE(3) | 特征匹配 + PnP / ICP |
+| 三维建图 | RGB-D 帧 + 位姿 | 局部点云地图 | 基于深度反投影 + 点云融合 |
+| 障碍物检测 | 点云地图 | 前方障碍物距离/方位 | 地面分割 + 聚类 |
+| 路径规划 | 障碍物图 + 目标点 | 推荐行进方向/转向角 | 简单势场法 / A* |
+
+**部署方式**
+
+```bash
+python -m perception.da3_service --host 0.0.0.0 --port 8002
+```
+
+**对外接口**
+
+- `POST /depth`：单张图像深度估计
+- `POST /pose`：两帧图像位姿估计
+- `POST /map/update`：上传一帧，更新局部地图
+- `POST /map/obstacles`：获取前方障碍物
+- `POST /navigate`：给定目标，返回推荐方向
+
+### 3.5 三维建图与导航
+
+**建图策略**
+
+- 采用**帧到局部地图**的增量式点云融合。
+- 保存最近 N 帧（默认 60 帧，约 30~60s）的 RGB-D 关键帧。
+- 对每帧深度图做以下处理：
+  1. 反投影为相机坐标系点云。
+  2. 通过估计位姿变换到世界坐标系。
+  3. 做地面平面分割（RANSAC），区分地面与障碍物。
+  4. 对障碍物点云做体素降采样与聚类。
+
+**导航策略**
+
+- **局部避障**：根据前方障碍物分布，计算左右两侧通行代价，选择安全方向。
+- **目标导航**：给定目标方位角，结合 3D 障碍物图做 A* / Dijkstra 规划，输出转向建议。
+- 输出给 Qwen / 本地执行器的建议：`FREE_LEFT`、`FREE_RIGHT`、`BLOCKED_FRONT`、`CLEAR_AHEAD`。
+
+**与 Brain API 的协作**
+
+```text
+手机上传图像帧
+    │
+    ▼
+Robot Brain API ──▶ Depth Anything 3 服务
+    │                    │
+    │                    ▼
+    │              depth map + pose
+    │                    │
+    │                    ▼
+    │              3D Map / Obstacles / Navigation
+    │                    │
+    ▼                    ▼
+  Qwen (多模态推理) ◀── 结构化 3D 信息（如 "左前方 0.8m 有障碍"）
+    │
+    ▼
+高层驾驶指令 + TTS
+```
 
 ---
 
@@ -215,11 +298,27 @@ public class LocalCommandExecutor {
   "duration_ms": 800,
   "tts_text": "左转绕行",
   "tts_audio_base64": "UklGRiQAAABXQVZFZm10IBAAAAABAAEA...",
-  "reason": "obstacle ahead on the right"
+  "reason": "obstacle ahead on the right",
+  "perception_3d": {
+    "depth_map_base64": "...",
+    "obstacles": [
+      {"distance_m": 0.8, "angle_deg": -15, "label": "chair"}
+    ],
+    "navigation_hint": "FREE_LEFT"
+  }
 }
 ```
 
-### 5.3 命令集
+### 5.3 三维感知数据字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `depth_map_base64` | string | PNG/JPEG 编码的深度图（可选，调试用） |
+| `obstacles` | array | 障碍物列表，含距离、方位角、类别 |
+| `navigation_hint` | string | 导航建议：`FREE_LEFT`、`FREE_RIGHT`、`BLOCKED_FRONT`、`CLEAR_AHEAD` |
+| `pose` | object | 相机位姿 `{x, y, z, qw, qx, qy, qz}` |
+
+### 5.4 命令集
 
 | 命令 | 含义 | 参数说明 |
 |------|------|----------|
@@ -233,6 +332,8 @@ public class LocalCommandExecutor {
 | FOLLOW | 跟随目标 | param = 速度 |
 | ROTATE_LEFT | 原地左转 | param = 速度 |
 | ROTATE_RIGHT | 原地右转 | param = 速度 |
+| APPROACH | 接近目标 | param = 速度 |
+| EXPLORE | 探索前方 | param = 速度 |
 
 ---
 
@@ -278,7 +379,11 @@ cd GPT-SoVITS
 python api.py --default_refer_path ./voices/ref.wav \
   --default_refer_text "参考文本" --default_refer_language zh
 
-# 3. 启动 Robot Brain API
+# 3. 启动 Depth Anything 3 3D 感知服务
+cd /path/to/brain-api
+python -m perception.da3_service --host 0.0.0.0 --port 8002
+
+# 4. 启动 Robot Brain API
 cd /path/to/brain-api
 python main.py --host 0.0.0.0 --port 8080
 ```
@@ -296,11 +401,12 @@ python main.py --host 0.0.0.0 --port 8080
 
 | 阶段 | 目标 | 产出 |
 |------|------|------|
-| M1 | 环境搭建 | Qwen + TTS + Brain API 在局域网跑通 |
-| M2 | 协议联调 | 手机能上传图像/传感器，能接收指令/音频 |
+| M1 | 环境搭建 | Qwen + TTS + DA3 + Brain API 在局域网跑通 |
+| M2 | 协议联调 | 手机能上传图像/传感器，能接收指令/音频/3D 感知结果 |
 | M3 | 本地执行 | 命令解释器 + 安全仲裁 + 电机控制 |
 | M4 | 端到端闭环 | 小车能按高层指令移动并语音反馈 |
-| M5 | 优化迭代 | 降低延迟、提升稳定性、增加命令集 |
+| M5 | 3D 建模与导航 | 能生成局部点云地图并基于障碍物做路径规划 |
+| M6 | 优化迭代 | 降低延迟、提升稳定性、增加命令集 |
 
 ---
 
@@ -308,8 +414,10 @@ python main.py --host 0.0.0.0 --port 8080
 
 | 风险 | 影响 | 对策 |
 |------|------|------|
-| 4GB 显存无法承载 3B 模型 | 部署失败 | 使用 int4 量化，必要时用 CPU offload |
+| 4GB 显存无法承载 3B 模型 + DA3 | 部署失败 | Qwen 用 int4，DA3 跑 CPU 或分时加载 |
 | Qwen 推理延迟高 | 控制不连贯 | 高层指令 + 本地持续执行，超时停车 |
+| 深度估计精度不足 | 碰撞风险 | DA3 结果只作参考，超声波做最终兜底 |
+| 位姿漂移累积 | 3D 地图失真 | 只做局部地图（60 帧滑动窗口），不长期保存 |
 | 网络抖动/断开 | 小车失控 | 心跳检测，断网自动 STOP |
 | 语音克隆质量差 | 体验差 | 准备高质量参考音频，必要时换 TTS 方案 |
 | 泛化能力差 | 遇到未训练场景失效 | 增加 system prompt 约束 + 安全规则兜底 |
@@ -319,7 +427,10 @@ python main.py --host 0.0.0.0 --port 8080
 ## 10. 参考链接
 
 - OpenBot 仓库：`/data/code/OpenBot-MrRobt`
+- Depth Anything 3：`https://github.com/ByteDance-Seed/depth-anything-3`
 - 关键接入点：
   - `android/robot/src/main/java/org/openbot/env/PhoneController.java:128`
   - `android/robot/src/main/java/org/openbot/vehicle/Vehicle.java:286`
   - `android/robot/src/main/java/org/openbot/tflite/Autopilot.java:69`
+  - `brain-api/perception/da3_service.py`
+  - `brain-api/perception/mapping_3d.py`

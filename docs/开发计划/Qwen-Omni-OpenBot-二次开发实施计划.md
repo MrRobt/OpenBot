@@ -22,11 +22,12 @@
 | 阶段 | 任务 | 预计工时 | 依赖 |
 |------|------|----------|------|
 | **P0 环境准备** | 搭建 Python 环境与模型下载 | 0.5d | 无 |
-| **P1 服务端** | 部署 Qwen + TTS + Robot Brain API | 2d | P0 |
+| **P1 服务端** | 部署 Qwen + TTS + DA3 + Robot Brain API | 2.5d | P0 |
 | **P2 协议联调** | 手机-服务端数据协议打通 | 1d | P1 |
 | **P3 Android 改造** | OmniBrainClient + 本地执行 + 安全层 | 3d | P2 |
-| **P4 闭环验证** | 端到端实车测试与优化 | 2d | P3 |
-| **P5 文档交付** | 整理部署/使用文档 | 0.5d | P4 |
+| **P4 3D 感知与导航** | 深度估计、位姿、建图、路径规划 | 2d | P2 |
+| **P5 闭环验证** | 端到端实车测试与优化 | 2d | P3/P4 |
+| **P6 文档交付** | 整理部署/使用文档 | 0.5d | P5 |
 
 ---
 
@@ -127,19 +128,39 @@ modelscope download --model qwen/Qwen2.5-Omni-3B-AWQ --local_dir ./models/Qwen2.
     --output test.wav
   ```
 
-#### P1-3 开发 Robot Brain API
+#### P1-3 部署 Depth Anything 3 3D 感知服务
 
-- **目标**：整合 Qwen + TTS，对外暴露 `/decide` 接口。
-- **新建目录**：`/data/code/OpenBot-MrRobt/brain-api/`
+- **目标**：在 `http://pc-ip:8002` 提供深度估计、位姿估计、建图、导航接口。
+- **新建目录**：`/data/code/OpenBot-MrRobt/brain-api/perception/`
+- **核心文件**：
+  - `da3_service.py`：FastAPI 服务入口
+  - `depth_estimator.py`：Depth Anything 3 深度估计封装
+  - `pose_tracker.py`：帧间位姿估计
+  - `mapping_3d.py`：局部点云地图构建
+  - `navigator.py`：障碍物检测与路径规划
+- **模型下载**：
+  ```bash
+  huggingface-cli download ByteDance-Seed/Depth-Anything-3 --local-dir ./models/depth-anything-3
+  ```
+- **验收标准**：
+  - `POST /depth` 返回与输入图像同分辨率的深度图。
+  - `POST /map/obstacles` 返回前方障碍物列表。
+
+#### P1-4 开发 Robot Brain API
+
+- **目标**：整合 Qwen + TTS + DA3，对外暴露 `/decide` 接口。
+- **新增 3D 字段**：
+  - 请求：`image_base64`, `sonar`, ...
+  - 响应增加：`perception_3d.depth_map_base64`, `perception_3d.obstacles`, `perception_3d.navigation_hint`
 - **核心文件**：
   - `main.py`：FastAPI 入口
   - `prompts.py`：system prompt 与解析逻辑
-  - `clients.py`：Qwen client + TTS client 封装
+  - `clients.py`：Qwen client + TTS client + DA3 client 封装
   - `schemas.py`：Pydantic 请求/响应模型
 - **接口定义**：
   - `POST /decide`
   - 请求：`RobotInput`（image_base64, sonar, command_text）
-  - 响应：`RobotDecision`（command, param, duration_ms, tts_text, tts_audio_base64, reason）
+  - 响应：`RobotDecision`（command, param, duration_ms, tts_text, tts_audio_base64, reason, perception_3d）
 - **验收标准**：用 `curl` 发送测试请求，能返回正确 JSON 和 base64 音频。
 
 **示例启动命令**：
@@ -258,21 +279,66 @@ python main.py --host 0.0.0.0 --port 8080
 
 ---
 
-### P4 闭环验证
+### P4 3D 感知与导航
 
-#### P4-1 桌面联调
+#### P4-1 深度估计接口验证
+
+- **目标**：DA3 能从单张 RGB 图输出稳定深度图。
+- **步骤**：
+  1. 使用 OpenBot 手机实拍若干帧。
+  2. 调用 `POST /depth`，检查深度图质量。
+  3. 可视化深度图，确认近处物体颜色正确。
+- **验收标准**：连续 10 帧深度估计无异常，单帧耗时 < 300ms。
+
+#### P4-2 相机位姿估计验证
+
+- **目标**：通过连续帧估计相机相对运动。
+- **步骤**：
+  1. 实现特征点检测 + 光流/匹配。
+  2. 结合深度图做 PnP 或 ICP。
+  3. 输出 `x, y, z, qw, qx, qy, qz`。
+- **验收标准**：小车原地不动时位姿漂移 < 5cm；直线前进 1m 误差 < 20cm。
+
+#### P4-3 局部点云地图构建
+
+- **目标**：维护最近 60 帧的局部 3D 地图。
+- **步骤**：
+  1. 每帧深度图反投影为点云。
+  2. 根据位姿变换到世界坐标系。
+  3. 体素降采样与地面分割。
+- **验收标准**：能保存并可视化 pcd/ply 文件；地面与障碍物分离明显。
+
+#### P4-4 障碍物检测与导航规划
+
+- **目标**：根据 3D 地图输出安全行进方向。
+- **步骤**：
+  1. 前方扇形区域聚类，输出障碍物距离/方位。
+  2. 计算左右通行代价。
+  3. 输出 `navigation_hint`。
+- **验收标准**：前方有障碍时提示 `BLOCKED_FRONT`；左侧空旷时提示 `FREE_LEFT`。
+
+#### P4-5 与 Brain API 联调
+
+- **目标**：`/decide` 返回的 `perception_3d` 字段完整可用。
+- **验收标准**：Qwen prompt 中包含 3D 感知摘要，决策符合障碍物分布。
+
+---
+
+### P5 闭环验证
+
+#### P5-1 桌面联调
 
 - 小车不装轮子/架空，只验证电机指令是否正确响应。
 - 验证命令：**STOP / FORWARD / TURN_LEFT / TURN_RIGHT**。
 - **验收标准**：电机按预期转动。
 
-#### P4-2 安全功能验证
+#### P5-2 安全功能验证
 
 - 用手遮挡超声波，观察是否强制停车。
 - 断开 WiFi，观察是否自动停车。
 - 按手柄按钮，观察是否切换手动模式。
 
-#### P4-3 端到端场景测试
+#### P5-3 端到端场景测试
 
 | 场景 | 预期行为 |
 |------|----------|
@@ -280,23 +346,25 @@ python main.py --host 0.0.0.0 --port 8080
 | 前方有障碍物 | Qwen 输出 AVOID_LEFT / STOP，并播放语音 |
 | 语音指令“跟着我” | Qwen 输出 FOLLOW，小车跟随 |
 | 网络延迟高 | 本地安全层超时停车 |
+| 3D 导航提示左转 | Qwen 结合深度图输出 TURN_LEFT |
 
-#### P4-4 性能优化
+#### P5-4 性能优化
 
 - 测量 Qwen 推理延迟，目标 < 500ms。
+- 测量 DA3 深度估计延迟，目标 < 300ms。
 - 优化 JPEG 压缩质量与分辨率（建议 224x224，quality 70）。
 - 若延迟过高，考虑降低模型精度或增加本地策略缓存。
 
 ---
 
-### P5 文档交付
+### P6 文档交付
 
-#### P5-1 编写部署文档
+#### P6-1 编写部署文档
 
 - 文件：`docs/设计方案/部署手册.md`
 - 内容：环境安装、模型下载、服务启动、手机配置。
 
-#### P5-2 编写使用说明
+#### P6-2 编写使用说明
 
 - 文件：`docs/设计方案/使用说明.md`
 - 内容：开机顺序、语音指令示例、安全注意事项。
@@ -314,7 +382,14 @@ brain-api/
 ├── prompts.py
 ├── schemas.py
 ├── requirements.txt
-└── test_client.py
+├── test_client.py
+└── perception/
+    ├── __init__.py
+    ├── da3_service.py
+    ├── depth_estimator.py
+    ├── pose_tracker.py
+    ├── mapping_3d.py
+    └── navigator.py
 ```
 
 ### Android 端
@@ -341,11 +416,16 @@ android/robot/src/main/res/xml/preferences.xml
 |--------|----------|
 | Qwen 服务可用 | `curl /v1/chat/completions` 返回正常 |
 | TTS 服务可用 | 输入文本能生成可播放的 `.wav` |
-| Brain API 可用 | `/decide` 返回正确 JSON + base64 音频 |
+| DA3 深度估计可用 | `POST /depth` 返回正确深度图 |
+| DA3 位姿估计可用 | `POST /pose` 返回合理位姿 |
+| 3D 地图可用 | 能保存并可视化局部点云 |
+| 导航规划可用 | 前方障碍时返回正确 `navigation_hint` |
+| Brain API 可用 | `/decide` 返回正确 JSON + base64 音频 + 3D 感知字段 |
 | 手机能连 Brain | WebSocket 稳定，100 帧无断开 |
 | 指令能驱动电机 | FORWARD / TURN_LEFT / STOP 等执行正确 |
 | 安全兜底生效 | 超声波触发停车、断网停车、手柄接管 |
 | 语音反馈正常 | 每次决策后播放对应 TTS |
+| 3D 导航闭环 | 决策与障碍物分布一致 |
 
 ---
 
@@ -354,6 +434,8 @@ android/robot/src/main/res/xml/preferences.xml
 | 风险 | 应对 |
 |------|------|
 | 4GB 显存无法运行 3B AWQ | 换用 GPTQ / bitsandbytes 4-bit / CPU offload |
+| DA3 深度估计精度不足 | 只作决策参考，超声波做最终碰撞兜底 |
+| 位姿漂移导致 3D 地图失真 | 使用滑动窗口局部地图，不长期累积 |
 | Qwen 输出非标准 JSON | 增加 JSON 解析容错 + prompt 约束 |
 | WebSocket 不稳定 | 增加自动重连 + 降级为 HTTP polling |
 | 语音克隆效果差 | 换用更高质量参考音频或换 F5-TTS / Fish Speech |
@@ -366,6 +448,7 @@ android/robot/src/main/res/xml/preferences.xml
 1. 确认局域网电脑配置（GPU 型号、CUDA 版本、显存）。
 2. 确认目标 TTS 方案（GPT-SoVITS / F5-TTS / 其他）。
 3. 准备 5-10s 参考音频用于音色克隆。
-4. 开始 P0 环境搭建。
+4. 确认 Depth Anything 3 运行方式（GPU / CPU）。
+5. 开始 P0 环境搭建。
 
 确认后可直接进入 P1 服务端部署。
