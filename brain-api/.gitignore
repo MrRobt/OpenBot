@@ -23,6 +23,11 @@ models/
 *.swp
 *.swo
 
+# Node / React
+node_modules/
+web-control/dist/
+web-control/.vite/
+
 # Logs
 *.log
 

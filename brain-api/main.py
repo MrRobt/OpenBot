@@ -14,6 +14,8 @@ from prompts import build_user_prompt, parse_decision
 from pydantic import BaseModel, Field
 from schemas import Perception3D, RobotDecision, RobotInput
 
+import uvicorn
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("brain_api")
 
@@ -104,6 +106,11 @@ def decide(req: DecisionRequest) -> RobotDecision:
 
 
 if __name__ == "__main__":
-    import uvicorn
+    import argparse
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")))
+    args = parser.parse_args()
+
+    uvicorn.run("main:app", host=args.host, port=args.port, reload=False)

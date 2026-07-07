@@ -19,6 +19,11 @@ brain-api/
 ├── requirements.txt         # Python 依赖
 ├── test_client.py           # 测试客户端
 ├── download_da3.sh          # DA3 模型下载脚本
+├── README.md                # 本文档
+├── web-control/             # React Web 控制面板
+│   ├── src/App.jsx
+│   ├── src/App.css
+│   └── vite.config.js
 └── perception/              # Depth Anything 3 3D 感知模块
     ├── da3_service.py       # 3D 感知 FastAPI 服务
     ├── depth_estimator.py   # 深度估计
@@ -68,11 +73,42 @@ cd brain-api
 python main.py
 ```
 
-### 4. 测试
+### 4. 启动 Web 控制面板（可选）
+
+```bash
+cd brain-api/web-control
+npm install
+npm run dev -- --host 0.0.0.0
+```
+
+浏览器访问控制面板地址（默认）：`http://<服务器IP>:5173/`
+
+### 5. 测试
 
 ```bash
 python test_client.py --image test.jpg --command "前进" --sonar 100
 ```
+
+## Mock / 演示模式
+
+如果你没有 GPU、模型未下载或 Qwen/TTS 服务未启动，可以开启 Mock 模式快速跑通整个链路：
+
+```bash
+# Terminal 1: 3D 感知服务（合成深度图）
+MOCK_PERCEPTION=1 python -m perception.da3_service --port 8002
+
+# Terminal 2: Brain API（模拟 Qwen + TTS）
+MOCK_SERVICES=1 DA3_BASE_URL=http://localhost:8002 python main.py --port 8081
+
+# Terminal 3: Web 面板
+cd web-control
+npm run dev -- --host 0.0.0.0
+```
+
+| 变量 | 说明 |
+|------|------|
+| `MOCK_PERCEPTION=1` | DA3 返回合成深度图和模拟位姿 |
+| `MOCK_SERVICES=1` | Qwen/TTS 返回模拟决策和静音 WAV |
 
 ## 环境变量
 

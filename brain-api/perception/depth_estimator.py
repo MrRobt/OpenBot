@@ -3,6 +3,9 @@
 The official PyTorch implementation is expected to follow the Depth-Anything-3
 repo layout. This module provides a thin adapter so the rest of the system only
 depends on ``predict(image) -> depth_map``.
+
+When ``MOCK_PERCEPTION=1`` or torch/transformers are unavailable, falls back to
+a synthetic depth generator for demo/development.
 """
 
 from __future__ import annotations
@@ -10,14 +13,31 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+MOCK_MODE = os.getenv("MOCK_PERCEPTION", "0") == "1"
+
+
+def _mock_depth(rgb: np.ndarray) -> np.ndarray:
+    """Generate a plausible synthetic depth map from image intensity/edges."""
+    import cv2
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    # Blur to simulate spatially smooth depth.
+    blurred = cv2.GaussianBlur(gray, (21, 21), 5.0)
+    # Invert: darker pixels farther, lighter closer, with noise.
+    depth = 1.0 / (blurred / 255.0 + 0.2) + np.random.normal(0, 0.05, gray.shape)
+    # Normalize to 0.3~5.0 meters.
+    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+    depth = depth * 4.7 + 0.3
+    return depth.astype(np.float32)
 
 
 class DepthEstimator:
@@ -30,18 +50,30 @@ class DepthEstimator:
         input_size: int = 518,
     ) -> None:
         self.model_path = Path(model_path)
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
         self.input_size = input_size
         self._model: Any | None = None
+        self._processor: Any | None = None
+        self._mock = False
         self._load_model()
 
     def _load_model(self) -> None:
-        """Load the DA3 checkpoint.
+        """Load the DA3 checkpoint or fall back to mock mode."""
+        if MOCK_MODE:
+            logger.warning("MOCK_PERCEPTION=1: using synthetic depth generator")
+            self._mock = True
+            return
 
-        This is a placeholder that attempts the most common pattern:
-        ``DepthAnything3Pipeline`` from the official repo. Adjust once the
-        exact hub/model layout is known.
-        """
+        try:
+            # pylint: disable=import-outside-toplevel
+            import torch
+
+            self.device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        except Exception as exc:
+            logger.warning("torch not available (%s), switching to mock depth", exc)
+            self._mock = True
+            return
+
         try:
             # Try the official Depth-Anything-3 import path first.
             # pylint: disable=import-outside-toplevel
@@ -55,8 +87,7 @@ class DepthEstimator:
             logger.warning("Could not import DepthAnything3Pipeline: %s", exc)
 
         try:
-            # Fallback: transformers AutoModelForDepthEstimation if the hub
-            # provides a compatible config.
+            # Fallback: transformers AutoModelForDepthEstimation.
             # pylint: disable=import-outside-toplevel
             from transformers import AutoProcessor, AutoModelForDepthEstimation
 
@@ -68,10 +99,8 @@ class DepthEstimator:
         except Exception as exc:  # pragma: no cover
             logger.warning("Transformers fallback failed: %s", exc)
 
-        raise RuntimeError(
-            f"Unable to load Depth Anything 3 from {self.model_path}. "
-            "Please install the official depth-anything-3 package or verify the checkpoint path."
-        )
+        logger.warning("Unable to load DA3 checkpoint, using mock depth generator")
+        self._mock = True
 
     def _decode_image(self, image_data: str | bytes | np.ndarray) -> np.ndarray:
         """Accept base64 string, raw bytes, or numpy array and return RGB array."""
@@ -105,13 +134,21 @@ class DepthEstimator:
         rgb = self._decode_image(image)
         h, w = rgb.shape[:2]
 
+        if self._mock:
+            depth = _mock_depth(rgb)
+            depth = np.asarray(Image.fromarray(depth).resize((w, h), Image.BILINEAR), dtype=np.float32)
+            return depth
+
         if self._model is None:
             raise RuntimeError("Model not loaded")
 
         # Official DA3 pipeline path
+        # pylint: disable=import-outside-toplevel
+        import torch
+
         if hasattr(self._model, "infer"):
             depth = self._model.infer(rgb, input_size=self.input_size)
-        elif hasattr(self._model, "__call__") and hasattr(self, "_processor"):
+        elif hasattr(self._model, "__call__") and self._processor is not None:
             pil = Image.fromarray(rgb)
             inputs = self._processor(images=pil, return_tensors="pt").to(self.device)
             with torch.no_grad():
